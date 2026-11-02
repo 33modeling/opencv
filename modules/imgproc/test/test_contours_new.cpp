@@ -70,6 +70,49 @@ inline static void drawContours(Mat& img,
     }
 }
 
+#if CHECK_OLD
+static void checkLegacyContours(const Mat& image, const vector<vector<Point>>& contours,
+                                const vector<Vec4i>& hierarchy, int mode, int method)
+{
+    const bool exact = method != CHAIN_APPROX_TC89_L1;
+    vector<vector<Point>> reference;
+    vector<Vec4i> referenceHierarchy;
+    findContours_legacy(image, reference, referenceHierarchy, mode, method);
+    ASSERT_EQ(reference.size(), contours.size());
+    EXPECT_MAT_NEAR(Mat(referenceHierarchy), Mat(hierarchy), 0);
+
+    vector<vector<Point>> boundary;
+    if (!exact)
+    {
+        // Legacy TC89_L1 has known vertex-selection differences (see #25663).
+        // Keep its contour/hierarchy comparison and check vertices against the
+        // unapproximated boundary instead of requiring the old approximation.
+        vector<Vec4i> boundaryHierarchy;
+        findContours_legacy(image, boundary, boundaryHierarchy, mode, CHAIN_APPROX_NONE);
+        ASSERT_EQ(reference.size(), boundary.size());
+        EXPECT_MAT_NEAR(Mat(boundaryHierarchy), Mat(hierarchy), 0);
+    }
+    for (size_t i = 0; i < contours.size(); ++i)
+    {
+        SCOPED_TRACE(format("contour = %zu", i));
+        if (exact)
+        {
+            EXPECT_MAT_NEAR(Mat(reference[i]), Mat(contours[i]), 0);
+        }
+        else
+        {
+            ASSERT_FALSE(contours[i].empty());
+            EXPECT_LE(contours[i].size(), boundary[i].size());
+            for (const Point& point : contours[i])
+            {
+                EXPECT_TRUE(std::find(boundary[i].begin(), boundary[i].end(), point) != boundary[i].end())
+                    << "Point " << point << " is not on the unapproximated boundary";
+            }
+        }
+    }
+}
+#endif
+
 //==================================================================================================
 
 // Test parameters - mode + method
@@ -476,16 +519,7 @@ TEST_P(Imgproc_FindContours_Modes2, new_accuracy)
         EXPECT_EQ(0., diff1);
     }
 #if CHECK_OLD
-    vector<vector<Point>> contours_o;
-    vector<Vec4i> hierarchy_o;
-    findContours(img, contours_o, hierarchy_o, mode, method);
-    ASSERT_EQ(contours_o.size(), contours.size());
-    for (size_t i = 0; i < contours_o.size(); ++i)
-    {
-        SCOPED_TRACE(format("contour = %zu", i));
-        EXPECT_MAT_NEAR(Mat(contours_o[i]), Mat(contours[i]), 0);
-    }
-    EXPECT_MAT_NEAR(Mat(hierarchy_o), Mat(hierarchy), 0);
+    checkLegacyContours(img, contours, hierarchy, mode, method);
 #endif
 }
 
@@ -499,6 +533,7 @@ TEST_P(Imgproc_FindContours_Modes2, approx)
 
     for (int c = 0; c < 4; ++c)
     {
+        SCOPED_TRACE(format("case = %d", c));
         if (c != 0)
         {
             // noise + filter + threshold
@@ -508,13 +543,12 @@ TEST_P(Imgproc_FindContours_Modes2, approx)
             Mat fimg;
             boxFilter(img, fimg, CV_8U, Size(5, 5));
 
-            Mat timg;
             const int level = 44 + c * 42;
             // 'level' goes through:
             // 86 - some black speckles on white
             // 128 - 50/50 black/white
             // 170 - some white speckles on black
-            cv::threshold(fimg, timg, level, 255, THRESH_BINARY);
+            cv::threshold(fimg, img, level, 255, THRESH_BINARY);
         }
         else
         {
@@ -526,30 +560,109 @@ TEST_P(Imgproc_FindContours_Modes2, approx)
             rectangle(img, center, center + cut, Scalar(0), FILLED);
         }
 
+        ASSERT_EQ(0, countNonZero((img != 0) & (img != 255)));
         vector<vector<Point>> contours;
         vector<Vec4i> hierarchy;
         findContours(img, contours, hierarchy, mode, method);
 
 #if CHECK_OLD
-        // NOTE: old and new function results might not match when approximation mode is TC89.
-        // Currently this test passes, but might fail for other random data.
-        // See https://github.com/opencv/opencv/issues/25663 for details.
-        vector<vector<Point>> contours_o;
-        vector<Vec4i> hierarchy_o;
-        findContours_legacy(img, contours_o, hierarchy_o, mode, method);
-        ASSERT_EQ(contours_o.size(), contours.size());
-        for (size_t i = 0; i < contours_o.size(); ++i)
-        {
-            SCOPED_TRACE(format("c = %d, contour = %zu", c, i));
-            EXPECT_MAT_NEAR(Mat(contours_o[i]), Mat(contours[i]), 0);
-        }
-        EXPECT_MAT_NEAR(Mat(hierarchy_o), Mat(hierarchy), 0);
-#endif
+        checkLegacyContours(img, contours, hierarchy, mode, method);
+#else
         // TODO: check something
+#endif
     }
 }
 
-// TODO: offset test
+typedef testing::TestWithParam<tuple<int, int, Point, bool, bool>> Imgproc_FindContours_ROIOffset;
+
+TEST_P(Imgproc_FindContours_ROIOffset, border_and_hole)
+{
+    const int mode = get<0>(GetParam());
+    const int method = get<1>(GetParam());
+    const Point offset = get<2>(GetParam());
+    const bool withHierarchy = get<3>(GetParam());
+    const bool matOutput = get<4>(GetParam());
+
+    // Nonzero pixels outside the non-contiguous ROI must not extend its contours.
+    Mat parent(15, 19, CV_8UC1, Scalar(123));
+    Mat image = parent(Rect(4, 2, 11, 9));
+    image.setTo(Scalar(37));
+    image(Rect(3, 3, 5, 3)).setTo(Scalar(0));
+    const Mat original = parent.clone();
+    ASSERT_FALSE(image.isContinuous());
+
+    // Coordinates refer to foreground pixels, including around the hole.
+    vector<vector<Point>> expected = {{Point(0, 0), Point(0, 8), Point(10, 8), Point(10, 0)}};
+    if (mode != RETR_EXTERNAL)
+        expected.push_back({Point(2, 3), Point(3, 2), Point(7, 2), Point(8, 3),
+                            Point(8, 5), Point(7, 6), Point(3, 6), Point(2, 5)});
+    for (auto& contour : expected)
+    {
+        vector<Point> points;
+        for (size_t i = 0; i < contour.size(); ++i)
+        {
+            const Point start = contour[i];
+            points.push_back(start + offset);
+            if (method == CHAIN_APPROX_NONE)
+            {
+                const Point delta = contour[(i + 1) % contour.size()] - start;
+                const int length = std::max(std::abs(delta.x), std::abs(delta.y));
+                const Point step(delta.x / length, delta.y / length);
+                for (int j = 1; j < length; ++j)
+                    points.push_back(start + step * j + offset);
+            }
+        }
+        contour.swap(points);
+    }
+
+    vector<vector<Point>> contours;
+    vector<Vec4i> hierarchy;
+    const _OutputArray hierarchyOutput = withHierarchy ? _OutputArray(hierarchy) : _OutputArray();
+    if (matOutput)
+    {
+        vector<Mat> mats;
+        findContours(image, mats, hierarchyOutput, mode, method, offset);
+        contours.resize(mats.size());
+        for (size_t i = 0; i < mats.size(); ++i)
+            mats[i].copyTo(contours[i]);
+    }
+    else
+    {
+        findContours(image, contours, hierarchyOutput, mode, method, offset);
+    }
+
+    EXPECT_EQ(0., cvtest::norm(parent, original, NORM_INF));
+    ASSERT_EQ(expected.size(), contours.size());
+    if (withHierarchy)
+    {
+        EXPECT_EQ(contours.size(), hierarchy.size());
+    }
+
+    // The fast and general paths may choose different contour/start-point orders.
+    const auto pointLess = [](const Point& a, const Point& b) {
+        return a.y < b.y || (a.y == b.y && a.x < b.x);
+    };
+    const auto contourLess = [&](const vector<Point>& a, const vector<Point>& b) {
+        return std::lexicographical_compare(a.begin(), a.end(), b.begin(), b.end(), pointLess);
+    };
+    for (auto& contour : expected)
+        std::sort(contour.begin(), contour.end(), pointLess);
+    for (auto& contour : contours)
+        std::sort(contour.begin(), contour.end(), pointLess);
+    std::sort(expected.begin(), expected.end(), contourLess);
+    std::sort(contours.begin(), contours.end(), contourLess);
+    EXPECT_EQ(expected, contours);
+}
+
+// RETR_LIST without hierarchy exercises TRUCO; the other combinations are
+// general-scanner controls for the same ROI isolation and offset contract.
+INSTANTIATE_TEST_CASE_P(
+    ,
+    Imgproc_FindContours_ROIOffset,
+    testing::Combine(testing::Values(RETR_EXTERNAL, RETR_LIST, RETR_CCOMP, RETR_TREE),
+                     testing::Values(CHAIN_APPROX_NONE, CHAIN_APPROX_SIMPLE),
+                     testing::Values(Point(), Point(4, 2), Point(-7, -11)),
+                     testing::Bool(), testing::Bool()));
 
 // no RETR_FLOODFILL - no CV_32S input images
 INSTANTIATE_TEST_CASE_P(
